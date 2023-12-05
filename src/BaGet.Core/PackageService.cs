@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using NuGet.Versioning;
 
 namespace BaGet.Core
@@ -14,17 +16,26 @@ namespace BaGet.Core
         private readonly IUpstreamClient _upstream;
         private readonly IPackageIndexingService _indexer;
         private readonly ILogger<PackageService> _logger;
+        private readonly string _storePath;
 
         public PackageService(
             IPackageDatabase db,
             IUpstreamClient upstream,
             IPackageIndexingService indexer,
-            ILogger<PackageService> logger)
+            ILogger<PackageService> logger,
+            IOptionsSnapshot<FileSystemStorageOptions> options)
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _upstream = upstream ?? throw new ArgumentNullException(nameof(upstream));
             _indexer = indexer ?? throw new ArgumentNullException(nameof(indexer));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            
+            if (options == null) throw new ArgumentNullException(nameof(options));
+
+            // Resolve relative path components ('.'/'..') and ensure there is a trailing slash.
+            _storePath = Path.GetFullPath(options.Value.Path);
+            if (!_storePath.EndsWith(Path.DirectorySeparatorChar.ToString()))
+                _storePath += Path.DirectorySeparatorChar;
         }
 
         public async Task<IReadOnlyList<NuGetVersion>> FindPackageVersionsAsync(
@@ -95,10 +106,39 @@ namespace BaGet.Core
         /// <returns>True if the package exists locally or was indexed from an upstream source.</returns>
         private async Task<bool> MirrorAsync(string id, NuGetVersion version, CancellationToken cancellationToken)
         {
-            if (await _db.ExistsAsync(id, version, cancellationToken))
+            var dbExist = await _db.ExistsAsync(id, version, cancellationToken);
+            
+            // Check if the package exists locally, including missing packages in filesystem storage.
+            if (dbExist)
             {
-                return true;
+                // example path:
+                // /var/baget/packages/packages/farmerp.httpapi/1.0.0-preview-20231115-113309/farmerp.httpapi.1.0.0-preview-20231115-113309.nupkg
+                var packagePath = GetFullPath(
+                    Path.Combine("packages", 
+                        id.ToLowerInvariant(), 
+                        version.ToNormalizedString().ToLowerInvariant(), 
+                        $"{id.ToLowerInvariant()}.{version.ToNormalizedString().ToLowerInvariant()}.nupkg"));
+                
+                
+                if (File.Exists(packagePath))
+                {
+                    // _logger.LogInformation(
+                    //     "Package {PackageId} {PackageVersion} exists locally at {PackagePath}",
+                    //     id,
+                    //     version,
+                    //     packagePath);
+                    
+                    return true;
+                }
+                
+                _logger.LogWarning(
+                    "Package {PackageId} {PackageVersion} does not exist locally at {PackagePath}, but exists in database. " +
+                    "This is likely due to a missing package file in the filesystem storage",
+                    id,
+                    version,
+                    packagePath);
             }
+            
 
             _logger.LogInformation(
                 "Package {PackageId} {PackageVersion} does not exist locally. Checking upstream feed...",
@@ -144,6 +184,25 @@ namespace BaGet.Core
 
                 return false;
             }
+        }
+        
+        private string GetFullPath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                throw new ArgumentException("Path is required", nameof(path));
+            }
+
+            var fullPath = Path.GetFullPath(Path.Combine(_storePath, path));
+
+            // Verify path is under the _storePath.
+            if (!fullPath.StartsWith(_storePath, StringComparison.Ordinal) ||
+                fullPath.Length == _storePath.Length)
+            {
+                throw new ArgumentException("Path resolves outside store path", nameof(path));
+            }
+
+            return fullPath;
         }
     }
 }
